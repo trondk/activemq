@@ -13,8 +13,6 @@ import (
 	"pack.ag/amqp"
 )
 
-
-
 func main() {
 	serverAddr := flag.String("server", "", "The host and port of the ActiveMQ Artemis AMQP acceptor.")
 	msgSize := flag.Int("size", 1024, "The size of the payload for each message sent.")
@@ -83,7 +81,9 @@ func producer(ctx context.Context, sender *amqp.Sender, msgSize int, messagesSen
 		payload[i] = 'X'
 	}
 	message := amqp.NewMessage(payload)
-
+	message.Annotations = map[interface{}]interface{}{
+		"x-opt-delivery-mode": uint8(2),
+	}
 	for {
 		select {
 		case <-ctx.Done():
