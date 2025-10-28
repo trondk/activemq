@@ -4,26 +4,50 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"pack.ag/amqp"
 )
 
+type ConnectionManager struct {
+	servers     []string
+	username    string
+	password    string
+	queueName   string
+	currentIdx  int
+	mu          sync.Mutex
+	client      *amqp.Client
+	session     *amqp.Session
+	sender      *amqp.Sender
+}
+
 func main() {
-	serverAddr := flag.String("server", "", "The host and port of the ActiveMQ Artemis AMQP acceptor.")
+	serverAddr := flag.String("server", "", "Comma-separated list of host:port of the ActiveMQ Artemis AMQP acceptors (e.g., 'localhost:5672,localhost:5673').")
 	msgSize := flag.Int("size", 1024, "The size of the payload for each message sent.")
 	username := flag.String("username", "admin", "Username for authentication.")
 	password := flag.String("password", "admin", "Password for authentication.")
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be sent.")
+	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
+	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
 	flag.Parse()
 
 	if *serverAddr == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	servers := strings.Split(*serverAddr, ",")
+
+	// Trim spaces from server addresses
+	for i := range servers {
+		servers[i] = strings.TrimSpace(servers[i])
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,28 +61,40 @@ func main() {
 		cancel()
 	}()
 
-	client, err := amqp.Dial("amqp://"+*serverAddr, amqp.ConnSASLPlain(*username, *password))
-	if err != nil {
-		log.Fatalf("Failed to connect to AMQP server: %v", err)
-	}
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		log.Fatalf("Failed to create AMQP session: %v", err)
+	connMgr := &ConnectionManager{
+		servers:   servers,
+		username:  *username,
+		password:  *password,
+		queueName: *queueName,
 	}
 
-	sender, err := session.NewSender(amqp.LinkTargetAddress(*queueName))
-	if err != nil {
-		log.Fatalf("Failed to create AMQP sender: %v", err)
+	// Initial connection
+	if err := connMgr.Connect(ctx); err != nil {
+		log.Fatalf("Failed to establish initial connection: %v", err)
 	}
-	defer sender.Close(context.Background())
+	defer connMgr.Close()
+
+	// Load message content from file if specified
+	var messageContent []byte
+	if *inputFile != "" {
+		file, err := os.Open(*inputFile)
+		if err != nil {
+			log.Fatalf("Failed to open input file %s: %v", *inputFile, err)
+		}
+		defer file.Close()
+
+		messageContent, err = io.ReadAll(file)
+		if err != nil {
+			log.Fatalf("Failed to read input file %s: %v", *inputFile, err)
+		}
+		log.Printf("Loaded message content from file: %s (%d bytes)", *inputFile, len(messageContent))
+	}
 
 	var messagesSent atomic.Uint64
 	startTime := time.Now()
 
 	// Start the producer goroutine
-	go producer(ctx, sender, *msgSize, &messagesSent)
+	go producer(ctx, connMgr, *msgSize, *durable, &messagesSent, messageContent)
 
 	// Start the throughput reporter goroutine
 	go throughputReporter(ctx, &messagesSent)
@@ -75,23 +111,129 @@ func main() {
 	fmt.Printf("Overall average throughput: %.2f msg/s\n", avgThroughput)
 }
 
-func producer(ctx context.Context, sender *amqp.Sender, msgSize int, messagesSent *atomic.Uint64) {
-	payload := make([]byte, msgSize)
-	for i := range payload {
-		payload[i] = 'X'
+func (cm *ConnectionManager) Connect(ctx context.Context) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Try all servers in the cluster
+	for i := 0; i < len(cm.servers); i++ {
+		serverIdx := (cm.currentIdx + i) % len(cm.servers)
+		server := cm.servers[serverIdx]
+
+		log.Printf("Attempting to connect to %s...", server)
+		client, err := amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+		if err != nil {
+			log.Printf("Failed to connect to %s: %v", server, err)
+			continue
+		}
+
+		session, err := client.NewSession()
+		if err != nil {
+			log.Printf("Failed to create session on %s: %v", server, err)
+			client.Close()
+			continue
+		}
+
+		sender, err := session.NewSender(amqp.LinkTargetAddress(cm.queueName))
+		if err != nil {
+			log.Printf("Failed to create sender on %s: %v", server, err)
+			client.Close()
+			continue
+		}
+
+		cm.client = client
+		cm.session = session
+		cm.sender = sender
+		cm.currentIdx = serverIdx
+		log.Printf("Successfully connected to %s", server)
+		return nil
+	}
+
+	return fmt.Errorf("failed to connect to any server in the cluster")
+}
+
+func (cm *ConnectionManager) Reconnect(ctx context.Context) error {
+	cm.mu.Lock()
+	// Close existing connections
+	if cm.sender != nil {
+		cm.sender.Close(context.Background())
+	}
+	if cm.client != nil {
+		cm.client.Close()
+	}
+	cm.sender = nil
+	cm.session = nil
+	cm.client = nil
+	// Move to next server
+	cm.currentIdx = (cm.currentIdx + 1) % len(cm.servers)
+	cm.mu.Unlock()
+
+	// Wait a bit before reconnecting
+	time.Sleep(1 * time.Second)
+
+	return cm.Connect(ctx)
+}
+
+func (cm *ConnectionManager) GetSender() *amqp.Sender {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.sender
+}
+
+func (cm *ConnectionManager) Close() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.sender != nil {
+		cm.sender.Close(context.Background())
+	}
+	if cm.client != nil {
+		cm.client.Close()
+	}
+}
+
+func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64, messageContent []byte) {
+	var payload []byte
+	if len(messageContent) > 0 {
+		// Use content from file
+		payload = messageContent
+	} else {
+		// Generate dummy payload
+		payload = make([]byte, msgSize)
+		for i := range payload {
+			payload[i] = 'X'
+		}
 	}
 	message := amqp.NewMessage(payload)
-	message.Annotations = map[interface{}]interface{}{
-		"x-opt-delivery-mode": uint8(2),
+	if durable {
+		// Set the Delivery Mode to PERSISTENT (2) for durability.
+		message.Annotations = map[interface{}]interface{}{
+			"x-opt-delivery-mode": uint8(2),
+		}
 	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			sender := connMgr.GetSender()
+			if sender == nil {
+				log.Printf("No active sender, attempting to reconnect...")
+				if err := connMgr.Reconnect(ctx); err != nil {
+					log.Printf("Reconnection failed: %v", err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				sender = connMgr.GetSender()
+			}
+
 			err := sender.Send(ctx, message)
 			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+				log.Printf("Failed to send message: %v, attempting reconnection...", err)
+				if err := connMgr.Reconnect(ctx); err != nil {
+					log.Printf("Reconnection failed: %v", err)
+				}
 				time.Sleep(100 * time.Millisecond)
 			} else {
 				messagesSent.Add(1)
