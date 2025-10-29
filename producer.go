@@ -17,15 +17,87 @@ import (
 )
 
 type ConnectionManager struct {
-	servers     []string
-	username    string
-	password    string
-	queueName   string
-	currentIdx  int
-	mu          sync.Mutex
-	client      *amqp.Client
-	session     *amqp.Session
-	sender      *amqp.Sender
+	servers    []string
+	username   string
+	password   string
+	queueName  string
+	currentIdx int
+	mu         sync.Mutex
+	client     *amqp.Client
+	session    *amqp.Session
+	sender     *amqp.Sender
+}
+
+type MessageWithHeaders struct {
+	Content []byte
+	Headers map[string]interface{}
+}
+
+// parseSingleMessage parses a single message with headers.
+func parseSingleMessage(messageData string) MessageWithHeaders {
+	headers := make(map[string]interface{})
+	content := messageData
+
+	// Check if file has header section (separated by ---)
+	parts := strings.Split(content, "---")
+	if len(parts) >= 2 {
+		// Parse header section
+		headerSection := strings.TrimSpace(parts[0])
+		lines := strings.Split(headerSection, "\n")
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			// Parse key: value
+			colonIdx := strings.Index(line, ":")
+			if colonIdx > 0 {
+				key := strings.TrimSpace(line[:colonIdx])
+				value := strings.TrimSpace(line[colonIdx+1:])
+
+				// Convert "true"/"false" to boolean
+				if value == "true" {
+					headers[key] = true
+				} else if value == "false" {
+					headers[key] = false
+				} else {
+					headers[key] = value
+				}
+			}
+		}
+
+		// Get message content (everything after ---)
+		messageContent := strings.Join(parts[1:], "---")
+		return MessageWithHeaders{
+			Content: []byte(strings.TrimSpace(messageContent)),
+			Headers: headers,
+		}
+	}
+
+	// No header section, return content as-is
+	return MessageWithHeaders{
+		Content: []byte(content),
+		Headers: headers,
+	}
+}
+
+// parseMessagesFromFile parses a file that contains one or more messages
+// separated by a delimiter.
+func parseMessagesFromFile(data []byte, delimiter string) []MessageWithHeaders {
+	messagesStr := string(data)
+	messageParts := strings.Split(messagesStr, delimiter)
+	var messages []MessageWithHeaders
+
+	for _, part := range messageParts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		messages = append(messages, parseSingleMessage(part))
+	}
+
+	return messages
 }
 
 func main() {
@@ -75,7 +147,7 @@ func main() {
 	defer connMgr.Close()
 
 	// Load message content from file if specified
-	var messageContent []byte
+	var messages []MessageWithHeaders
 	if *inputFile != "" {
 		file, err := os.Open(*inputFile)
 		if err != nil {
@@ -83,18 +155,20 @@ func main() {
 		}
 		defer file.Close()
 
-		messageContent, err = io.ReadAll(file)
+		fileData, err := io.ReadAll(file)
 		if err != nil {
 			log.Fatalf("Failed to read input file %s: %v", *inputFile, err)
 		}
-		log.Printf("Loaded message content from file: %s (%d bytes)", *inputFile, len(messageContent))
+
+		messages = parseMessagesFromFile(fileData, "%%%")
+		log.Printf("Loaded %d messages from file: %s", len(messages), *inputFile)
 	}
 
 	var messagesSent atomic.Uint64
 	startTime := time.Now()
 
 	// Start the producer goroutine
-	go producer(ctx, connMgr, *msgSize, *durable, &messagesSent, messageContent)
+	go producer(ctx, connMgr, *msgSize, *durable, &messagesSent, messages)
 
 	// Start the throughput reporter goroutine
 	go throughputReporter(ctx, &messagesSent)
@@ -192,51 +266,106 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64, messageContent []byte) {
-	var payload []byte
-	if len(messageContent) > 0 {
-		// Use content from file
-		payload = messageContent
+func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
+	if len(messages) > 0 {
+		// Send messages from file
+		for {
+			for _, msgWithHeaders := range messages {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					payload := msgWithHeaders.Content
+					message := amqp.NewMessage(payload)
+
+					// Set ApplicationProperties from parsed headers
+					if len(msgWithHeaders.Headers) > 0 {
+						message.ApplicationProperties = msgWithHeaders.Headers
+						log.Printf("Set ApplicationProperties: %v", msgWithHeaders.Headers)
+					}
+
+					if durable {
+						message.Header = &amqp.MessageHeader{
+							Durable: true,
+						}
+					}
+
+				retrySend:
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							sender := connMgr.GetSender()
+							if sender == nil {
+								log.Printf("No active sender, attempting to reconnect...")
+								if err := connMgr.Reconnect(ctx); err != nil {
+									log.Printf("Reconnection failed: %v", err)
+									time.Sleep(1 * time.Second)
+									continue
+								}
+								sender = connMgr.GetSender()
+							}
+
+							err := sender.Send(ctx, message)
+							if err != nil {
+								log.Printf("Failed to send message: %v, attempting reconnection...", err)
+								if err := connMgr.Reconnect(ctx); err != nil {
+									log.Printf("Reconnection failed: %v", err)
+								}
+								time.Sleep(100 * time.Millisecond)
+							} else {
+								messagesSent.Add(1)
+								break retrySend
+							}
+						}
+					}
+					time.Sleep(100 * time.Millisecond) // Wait before sending the next message
+				}
+			}
+			log.Printf("All %d messages from file have been sent. Restarting...", len(messages))
+			time.Sleep(1 * time.Second) // Wait before re-sending the batch of messages
+		}
 	} else {
-		// Generate dummy payload
-		payload = make([]byte, msgSize)
+		// Generate and send dummy payload continuously
+		payload := make([]byte, msgSize)
 		for i := range payload {
 			payload[i] = 'X'
 		}
-	}
-	message := amqp.NewMessage(payload)
-	if durable {
-		// Set the Delivery Mode to PERSISTENT (2) for durability.
-		message.Annotations = map[interface{}]interface{}{
-			"x-opt-delivery-mode": uint8(2),
-		}
-	}
+		message := amqp.NewMessage(payload)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			sender := connMgr.GetSender()
-			if sender == nil {
-				log.Printf("No active sender, attempting to reconnect...")
-				if err := connMgr.Reconnect(ctx); err != nil {
-					log.Printf("Reconnection failed: %v", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				sender = connMgr.GetSender()
+		if durable {
+			message.Header = &amqp.MessageHeader{
+				Durable: true,
 			}
+		}
 
-			err := sender.Send(ctx, message)
-			if err != nil {
-				log.Printf("Failed to send message: %v, attempting reconnection...", err)
-				if err := connMgr.Reconnect(ctx); err != nil {
-					log.Printf("Reconnection failed: %v", err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				sender := connMgr.GetSender()
+				if sender == nil {
+					log.Printf("No active sender, attempting to reconnect...")
+					if err := connMgr.Reconnect(ctx); err != nil {
+						log.Printf("Reconnection failed: %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					sender = connMgr.GetSender()
 				}
-				time.Sleep(100 * time.Millisecond)
-			} else {
-				messagesSent.Add(1)
+
+				err := sender.Send(ctx, message)
+				if err != nil {
+					log.Printf("Failed to send message: %v, attempting reconnection...", err)
+					if err := connMgr.Reconnect(ctx); err != nil {
+						log.Printf("Reconnection failed: %v", err)
+					}
+					time.Sleep(100 * time.Millisecond)
+				} else {
+					messagesSent.Add(1)
+				}
 			}
 		}
 	}
