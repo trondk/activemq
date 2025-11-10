@@ -1,0 +1,17 @@
+This is a benchmark tool that uses the same code as producer.go and consumer.go. It needs to accept a destination broker and a receiver broker, so you can send messages to one active ActiveMQ broker and consume them from another (or the same) broker.
+
+The tool needs to take parameters for the message size and the duration the test should run. For example, if you specify 1 second, it will send messages for 1 second, then consume them back, and calculate the time spent on sending and consuming the messages.
+
+The output should include:
+
+    The speed of sending messages
+    The speed of consuming messages
+    The total time the test took
+
+There needs to be a parameter for the queue name.
+
+there is going to be a parameter called prometheus-out that takes a file destination, that generates a .prom file for the node exporter to prometheus, so the metrics can be scraped
+
+The Prometheus metrics include labels for sender and receiver broker addresses, allowing metrics to be tracked per broker configuration.
+
+the golang progran is going to be called activemq-benchmark
