@@ -15,6 +15,47 @@ import (
 	"pack.ag/amqp"
 )
 
+type MessageIDExporter struct {
+	file   *os.File
+	mu     sync.Mutex
+	closed bool
+}
+
+func NewMessageIDExporter(filePath string) (*MessageIDExporter, error) {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create export file: %w", err)
+	}
+	return &MessageIDExporter{
+		file:   file,
+		closed: false,
+	}, nil
+}
+
+func (e *MessageIDExporter) Write(messageID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return fmt.Errorf("exporter is closed")
+	}
+
+	_, err := fmt.Fprintln(e.file, messageID)
+	return err
+}
+
+func (e *MessageIDExporter) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil
+	}
+
+	e.closed = true
+	return e.file.Close()
+}
+
 type ConnectionManager struct {
 	servers     []string
 	username    string
@@ -32,6 +73,7 @@ func main() {
 	username := flag.String("username", "admin", "Username for authentication.")
 	password := flag.String("password", "admin", "Password for authentication.")
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be received from.")
+	exportMessageIDs := flag.String("export-message-ids", "", "Optional file path to export message IDs to check order (e.g., 'message_ids.txt').")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -73,8 +115,19 @@ func main() {
 	var messagesReceived atomic.Uint64
 	startTime := time.Now()
 
+	// Setup message ID exporter if requested
+	var exporter *MessageIDExporter
+	if *exportMessageIDs != "" {
+		var err error
+		exporter, err = NewMessageIDExporter(*exportMessageIDs)
+		if err != nil {
+			log.Fatalf("Failed to create message ID exporter: %v", err)
+		}
+		defer exporter.Close()
+	}
+
 	// Start the consumer goroutine
-	go consumer(ctx, connMgr, &messagesReceived)
+	go consumer(ctx, connMgr, &messagesReceived, exporter)
 
 	// Start the throughput reporter goroutine
 	go throughputReporter(ctx, &messagesReceived)
@@ -172,7 +225,7 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func consumer(ctx context.Context, connMgr *ConnectionManager, messagesReceived *atomic.Uint64) {
+func consumer(ctx context.Context, connMgr *ConnectionManager, messagesReceived *atomic.Uint64, exporter *MessageIDExporter) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -200,6 +253,24 @@ func consumer(ctx context.Context, connMgr *ConnectionManager, messagesReceived 
 			}
 			msg.Accept()
 			messagesReceived.Add(1)
+
+			// Export message number if exporter is configured
+			if exporter != nil {
+				if msg.ApplicationProperties != nil {
+					if messageNum, ok := msg.ApplicationProperties["messageNumber"]; ok {
+						msgNumStr := fmt.Sprintf("%v", messageNum)
+						if err := exporter.Write(msgNumStr); err != nil {
+							log.Printf("Failed to write message number to file: %v", err)
+						} else {
+							log.Printf("Exported message number: %s", msgNumStr)
+						}
+					} else {
+						log.Printf("Warning: Message has no messageNumber in ApplicationProperties")
+					}
+				} else {
+					log.Printf("Warning: Message has no ApplicationProperties")
+				}
+			}
 		}
 	}
 }

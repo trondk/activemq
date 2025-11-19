@@ -269,6 +269,7 @@ func (cm *ConnectionManager) Close() {
 func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
 	if len(messages) > 0 {
 		// Send messages from file
+		messageNum := uint64(0)
 		for {
 			for _, msgWithHeaders := range messages {
 				select {
@@ -282,7 +283,13 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 					if len(msgWithHeaders.Headers) > 0 {
 						message.ApplicationProperties = msgWithHeaders.Headers
 						log.Printf("Set ApplicationProperties: %v", msgWithHeaders.Headers)
+					} else {
+						message.ApplicationProperties = make(map[string]interface{})
 					}
+
+					// Add increasing message number
+					message.ApplicationProperties["messageNumber"] = messageNum
+					messageNum++
 
 					if durable {
 						message.Header = &amqp.MessageHeader{
@@ -332,19 +339,27 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 		for i := range payload {
 			payload[i] = 'X'
 		}
-		message := amqp.NewMessage(payload)
 
-		if durable {
-			message.Header = &amqp.MessageHeader{
-				Durable: true,
-			}
-		}
-
+		var messageNum uint64
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+				message := amqp.NewMessage(payload)
+
+				// Set increasing message number in ApplicationProperties
+				message.ApplicationProperties = map[string]interface{}{
+					"messageNumber": messageNum,
+				}
+				messageNum++
+
+				if durable {
+					message.Header = &amqp.MessageHeader{
+						Durable: true,
+					}
+				}
+
 				sender := connMgr.GetSender()
 				if sender == nil {
 					log.Printf("No active sender, attempting to reconnect...")
