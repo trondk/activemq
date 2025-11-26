@@ -4,16 +4,21 @@ High-performance AMQP 1.0 producer and consumer tools written in Go for Apache A
 
 ## Overview
 
-This project provides two command-line tools for working with ActiveMQ Artemis via the AMQP 1.0 protocol:
+This project provides command-line tools for working with ActiveMQ Artemis via the AMQP 1.0 protocol:
 
-- **Producer**: Sends messages at maximum throughput with configurable payload sizes
+- **Producer** (pack.ag/amqp): Original producer with basic AMQP support
+- **ProducerV2** (Azure AMQP): High-performance producer with smart settlement modes (13x faster for non-durable)
 - **Consumer**: Receives and acknowledges messages with performance metrics
+- **DiskTest**: Disk I/O benchmark tool to demonstrate durable vs non-durable performance differences
 
-Both tools feature:
-- Real-time throughput reporting (messages per second)
+### Key Features:
+- Real-time throughput reporting with thread count display
+- Concurrent producer threads for maximum throughput
+- Smart settlement modes (Settled for non-durable, Unsettled for durable)
 - Graceful shutdown with final statistics
 - SASL PLAIN authentication
-- Configurable queue targets
+- Cluster support with failover
+- Message file loading with header support
 - Atomic counters for accurate metrics
 
 ## Prerequisites
@@ -23,19 +28,17 @@ Both tools feature:
 
 ## Installation
 
-Clone and build both tools:
+Clone and build all tools:
 
 ```bash
 git clone https://github.com/trondk/activemq.git
 cd activemq
 
-# Build producer
-cd producer
-go build -o producer .
-
-# Build consumer
-cd ../consumer
-go build -o consumer .
+# Build all tools
+go build -o producer producer.go
+go build -o producerv2 producerv2.go
+go build -o consumer consumer.go
+go build -o disktest disktest.go
 ```
 
 ## Producer Usage
@@ -75,6 +78,76 @@ Options:
 ./producer -server localhost:5672 -username myuser -password mypass
 ```
 
+## ProducerV2 Usage (Recommended)
+
+ProducerV2 uses the Azure AMQP library with intelligent settlement modes for significantly better performance.
+
+### Command Line Options
+
+```bash
+./producerv2 [OPTIONS]
+
+Options:
+  -server string
+        Comma-separated list of host:port of the ActiveMQ Artemis AMQP acceptors
+  -size int
+        The size of the payload for each message sent (default: 1024)
+  -username string
+        Username for authentication (default: "admin")
+  -password string
+        Password for authentication (default: "admin")
+  -queue string
+        The target queue where messages will be sent (default: "DLQ")
+  -durable
+        Set message delivery mode to Persistent (Durable). Uses SenderSettleModeUnsettled
+        for reliability, SenderSettleModeSettled (fire-and-forget) for non-durable.
+  -file string
+        Optional: Load message content from a text file instead of generating dummy payload
+  -producers int
+        Number of concurrent producer goroutines for higher throughput (default: 1)
+```
+
+### ProducerV2 Examples
+
+**High-performance non-durable messages (fire-and-forget):**
+```bash
+./producerv2 -server localhost:5672 -queue testQueue
+# Output: 1 Thread Throughput: 60000 msg/s
+```
+
+**Maximum throughput with multiple threads:**
+```bash
+./producerv2 -server localhost:5672 -queue testQueue -producers 10
+# Output: 10 Threads Throughput: 38000 msg/s (total across all threads)
+```
+
+**Durable messages with reliability:**
+```bash
+./producerv2 -server localhost:5672 -queue testQueue -durable
+# Output: 1 Thread Throughput: 4500 msg/s (limited by disk fsync)
+```
+
+**Cluster with failover:**
+```bash
+./producerv2 -server 192.168.1.10:5672,192.168.1.11:5672 -queue testQueue
+```
+
+**Load messages from file:**
+```bash
+./producerv2 -server localhost:5672 -queue testQueue -file messages.txt
+```
+
+### Performance Comparison
+
+| Mode | Producer | ProducerV2 | Improvement |
+|------|----------|------------|-------------|
+| Non-durable (1 thread) | ~4,500 msg/s | ~60,000 msg/s | **13x faster** |
+| Non-durable (10 threads) | ~32,000 msg/s | ~38,000 msg/s | 1.2x faster |
+| Durable (1 thread) | ~4,400 msg/s | ~4,500 msg/s | Similar |
+| Durable (10 threads) | ~31,000 msg/s | ~32,500 msg/s | Slightly better |
+
+**Key Insight:** ProducerV2 is dramatically faster for non-durable messages due to `SenderSettleModeSettled` (fire-and-forget). For durable messages, both are limited by disk I/O.
+
 ## Consumer Usage
 
 ### Command Line Options
@@ -109,6 +182,71 @@ Options:
 ```bash
 ./consumer -server activemq.example.com:5672 -queue production.events
 ```
+
+## DiskTest Usage
+
+The DiskTest tool demonstrates why durable messaging has lower throughput than non-durable by measuring disk I/O performance with different block sizes and sync modes.
+
+### Command Line Options
+
+```bash
+./disktest [OPTIONS]
+
+Options:
+  -blocksize <bytes>  Block size for each write operation (default: 4096)
+  -total <bytes>      Total data to write in bytes (default: 104857600 = 100MB)
+  -fsync              Call fsync after each write (simulates durable messages)
+  -file <path>        Output file path (default: disktest.dat)
+  -help               Show help and examples
+```
+
+### DiskTest Examples
+
+**1. Test durable message performance (small blocks with fsync):**
+```bash
+./disktest -blocksize 1024 -total 10485760 -fsync
+# Simulates: Each message persisted to disk immediately
+# Expected: ~500-1000 msg/s (limited by disk IOPS)
+```
+
+**2. Test batched durable messages (64KB blocks with fsync):**
+```bash
+./disktest -blocksize 65536 -total 10485760 -fsync
+# Simulates: ~64 messages batched per fsync
+# Expected: Better throughput, same IOPS limit
+```
+
+**3. Test large batch durable messages (128KB blocks, sustained test):**
+```bash
+./disktest -blocksize 131072 -total 1073741824 -fsync
+# Simulates: ~128 messages batched per fsync (1GB write)
+# Expected: Even better throughput, maximizes IOPS efficiency, ~30 sec duration
+```
+
+**4. Test non-durable message performance (no fsync):**
+```bash
+./disktest -blocksize 1024 -total 10485760
+# Simulates: Messages buffered in memory (no disk wait)
+# Expected: 100,000+ msg/s (memory speed)
+```
+
+### DiskTest Results Interpretation
+
+| Test | Block Size | Fsync | Throughput | IOPS | Messages/sec |
+|------|-----------|-------|------------|------|--------------|
+| Small + Fsync | 1 KB | Yes | 0.62 MB/s | 1,275 | **638 msg/s** |
+| Large + Fsync | 128 KB | Yes | 36.98 MB/s | 592 | **296 msg/s** |
+| No Fsync | 1 KB | No | 292 MB/s | 299,758 | **299,758 msg/s** |
+
+**Understanding Results:**
+- **IOPS**: I/O Operations Per Second (with fsync: write + sync operations)
+- **Blocks/sec**: Number of write operations completed per second
+- **Throughput**: Data transfer rate in MB/s
+- **For durable messages**: max msg/s ≈ IOPS / 2
+
+**Key Insight:** The disk fsync rate (~500-1,000/sec) is the fundamental bottleneck for durable messages. This is why:
+- Durable messages: ~4,500 msg/s (limited by disk)
+- Non-durable messages: ~60,000 msg/s (memory buffered)
 
 ## Output
 
@@ -227,13 +365,17 @@ activemq/
 
 ## Dependencies
 
-Both tools use the same dependency:
-
 ```go
 require (
-    pack.ag/amqp v0.8.0
+    pack.ag/amqp v0.12.5              // Used by producer.go and consumer.go
+    github.com/Azure/go-amqp v1.5.0   // Used by producerv2.go
 )
 ```
+
+**Producer vs ProducerV2:**
+- `producer.go` uses the older `pack.ag/amqp` library
+- `producerv2.go` uses the newer, actively maintained `github.com/Azure/go-amqp` library
+- ProducerV2 achieves 13x better performance for non-durable messages using `SenderSettleModeSettled`
 
 ## Building
 
