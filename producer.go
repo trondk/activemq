@@ -213,7 +213,12 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 			continue
 		}
 
-		sender, err := session.NewSender(amqp.LinkTargetAddress(cm.queueName))
+		// Use unsettled mode for better performance (fire-and-forget)
+		// Messages are sent without waiting for broker acknowledgment
+		sender, err := session.NewSender(
+			amqp.LinkTargetAddress(cm.queueName),
+			amqp.LinkSenderSettle(amqp.ModeUnsettled),
+		)
 		if err != nil {
 			log.Printf("Failed to create sender on %s: %v", server, err)
 			client.Close()
