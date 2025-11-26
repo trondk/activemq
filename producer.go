@@ -109,6 +109,7 @@ func main() {
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
 	batchSize := flag.Int("batch", 100, "Number of messages to send before waiting for confirmation (async batch size).")
+	producers := flag.Int("producers", 1, "Number of concurrent producer goroutines for higher throughput.")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -168,11 +169,13 @@ func main() {
 	var messagesSent atomic.Uint64
 	startTime := time.Now()
 
-	// Start the appropriate producer goroutine
-	if len(messages) > 0 {
-		go producer_file(ctx, connMgr, *durable, *batchSize, &messagesSent, messages)
-	} else {
-		go producer(ctx, connMgr, *msgSize, *durable, *batchSize, &messagesSent)
+	// Start multiple producer goroutines for concurrent sending
+	for i := 0; i < *producers; i++ {
+		if len(messages) > 0 {
+			go producer_file(ctx, connMgr, *durable, *batchSize, &messagesSent, messages)
+		} else {
+			go producer(ctx, connMgr, *msgSize, *durable, *batchSize, &messagesSent)
+		}
 	}
 
 	// Start the throughput reporter goroutine
