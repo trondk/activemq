@@ -22,7 +22,7 @@ type ConnectionManager struct {
 	password   string
 	queueName  string
 	currentIdx int
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	client     *amqp.Client
 	session    *amqp.Session
 	sender     *amqp.Sender
@@ -167,8 +167,12 @@ func main() {
 	var messagesSent atomic.Uint64
 	startTime := time.Now()
 
-	// Start the producer goroutine
-	go producer(ctx, connMgr, *msgSize, *durable, &messagesSent, messages)
+	// Start the appropriate producer goroutine
+	if len(messages) > 0 {
+		go producer_file(ctx, connMgr, *durable, &messagesSent, messages)
+	} else {
+		go producer(ctx, connMgr, *msgSize, *durable, &messagesSent)
+	}
 
 	// Start the throughput reporter goroutine
 	go throughputReporter(ctx, &messagesSent)
@@ -249,8 +253,8 @@ func (cm *ConnectionManager) Reconnect(ctx context.Context) error {
 }
 
 func (cm *ConnectionManager) GetSender() *amqp.Sender {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	return cm.sender
 }
 
@@ -266,92 +270,27 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
-	if len(messages) > 0 {
-		// Send messages from file
-		messageNum := uint64(0)
-		for {
-			for _, msgWithHeaders := range messages {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					payload := msgWithHeaders.Content
-					message := amqp.NewMessage(payload)
-
-					// Set ApplicationProperties from parsed headers
-					if len(msgWithHeaders.Headers) > 0 {
-						message.ApplicationProperties = msgWithHeaders.Headers
-						log.Printf("Set ApplicationProperties: %v", msgWithHeaders.Headers)
-					} else {
-						message.ApplicationProperties = make(map[string]interface{})
-					}
-
-					// Add increasing message number
-					message.ApplicationProperties["messageNumber"] = messageNum
-					messageNum++
-
-					if durable {
-						message.Header = &amqp.MessageHeader{
-							Durable: true,
-						}
-					}
-
-				retrySend:
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							sender := connMgr.GetSender()
-							if sender == nil {
-								log.Printf("No active sender, attempting to reconnect...")
-								if err := connMgr.Reconnect(ctx); err != nil {
-									log.Printf("Reconnection failed: %v", err)
-									time.Sleep(1 * time.Second)
-									continue
-								}
-								sender = connMgr.GetSender()
-							}
-
-							err := sender.Send(ctx, message)
-							if err != nil {
-								log.Printf("Failed to send message: %v, attempting reconnection...", err)
-								if err := connMgr.Reconnect(ctx); err != nil {
-									log.Printf("Reconnection failed: %v", err)
-								}
-								time.Sleep(100 * time.Millisecond)
-							} else {
-								messagesSent.Add(1)
-								break retrySend
-							}
-						}
-					}
-					time.Sleep(100 * time.Millisecond) // Wait before sending the next message
-				}
-			}
-			log.Printf("All %d messages from file have been sent. Restarting...", len(messages))
-			time.Sleep(1 * time.Second) // Wait before re-sending the batch of messages
-		}
-	} else {
-		// Generate and send dummy payload continuously
-		payload := make([]byte, msgSize)
-		for i := range payload {
-			payload[i] = 'X'
-		}
-
-		var messageNum uint64
-		for {
+func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
+	messageNum := uint64(0)
+	for {
+		for _, msgWithHeaders := range messages {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+				payload := msgWithHeaders.Content
 				message := amqp.NewMessage(payload)
 
-				// Set increasing message number in ApplicationProperties
-				message.ApplicationProperties = map[string]interface{}{
-					"messageNumber": messageNum,
+				// Set ApplicationProperties from parsed headers
+				if len(msgWithHeaders.Headers) > 0 {
+					message.ApplicationProperties = msgWithHeaders.Headers
+					log.Printf("Set ApplicationProperties: %v", msgWithHeaders.Headers)
+				} else {
+					message.ApplicationProperties = make(map[string]interface{})
 				}
+
+				// Add increasing message number
+				message.ApplicationProperties["messageNumber"] = messageNum
 				messageNum++
 
 				if durable {
@@ -360,28 +299,93 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 					}
 				}
 
-				sender := connMgr.GetSender()
-				if sender == nil {
-					log.Printf("No active sender, attempting to reconnect...")
-					if err := connMgr.Reconnect(ctx); err != nil {
-						log.Printf("Reconnection failed: %v", err)
-						time.Sleep(1 * time.Second)
-						continue
-					}
-					sender = connMgr.GetSender()
-				}
+			retrySend:
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						sender := connMgr.GetSender()
+						if sender == nil {
+							log.Printf("No active sender, attempting to reconnect...")
+							if err := connMgr.Reconnect(ctx); err != nil {
+								log.Printf("Reconnection failed: %v", err)
+								time.Sleep(1 * time.Second)
+								continue
+							}
+							continue
+						}
 
-				err := sender.Send(ctx, message)
-				if err != nil {
-					log.Printf("Failed to send message: %v, attempting reconnection...", err)
-					if err := connMgr.Reconnect(ctx); err != nil {
-						log.Printf("Reconnection failed: %v", err)
+						err := sender.Send(ctx, message)
+						if err != nil {
+							log.Printf("Failed to send message: %v, attempting reconnection...", err)
+							if err := connMgr.Reconnect(ctx); err != nil {
+								log.Printf("Reconnection failed: %v", err)
+							}
+							time.Sleep(100 * time.Millisecond)
+							continue
+						}
+
+						messagesSent.Add(1)
+						break retrySend
 					}
-					time.Sleep(100 * time.Millisecond)
-				} else {
-					messagesSent.Add(1)
+				}
+				time.Sleep(100 * time.Millisecond) // Wait before sending the next message
+			}
+		}
+		log.Printf("All %d messages from file have been sent. Restarting...", len(messages))
+		time.Sleep(1 * time.Second) // Wait before re-sending the batch of messages
+	}
+}
+
+func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64) {
+	// Generate and send dummy payload continuously
+	payload := make([]byte, msgSize)
+	for i := range payload {
+		payload[i] = 'X'
+	}
+
+	var messageNum uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			message := amqp.NewMessage(payload)
+
+			// Set increasing message number in ApplicationProperties
+			message.ApplicationProperties = map[string]interface{}{
+				"messageNumber": messageNum,
+			}
+			messageNum++
+
+			if durable {
+				message.Header = &amqp.MessageHeader{
+					Durable: true,
 				}
 			}
+
+			sender := connMgr.GetSender()
+			if sender == nil {
+				log.Printf("No active sender, attempting to reconnect...")
+				if err := connMgr.Reconnect(ctx); err != nil {
+					log.Printf("Reconnection failed: %v", err)
+					time.Sleep(1 * time.Second)
+				}
+				continue
+			}
+
+			err := sender.Send(ctx, message)
+			if err != nil {
+				log.Printf("Failed to send message: %v, attempting reconnection...", err)
+				if err := connMgr.Reconnect(ctx); err != nil {
+					log.Printf("Reconnection failed: %v", err)
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			messagesSent.Add(1)
 		}
 	}
 }

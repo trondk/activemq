@@ -35,6 +35,7 @@ func main() {
 	username := flag.String("username", "admin", "Username for authentication.")
 	password := flag.String("password", "admin", "Password for authentication.")
 	queueName := flag.String("queue", "DLQ", "The target queue for sending and receiving messages.")
+	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	prometheusOut := flag.String("prometheus-out", "", "Optional: Path to write Prometheus .prom file for node exporter.")
 	flag.Parse()
 
@@ -79,7 +80,7 @@ func main() {
 
 	// Phase 1: Send messages for specified duration
 	log.Printf("Starting send phase for %v...\n", *duration)
-	messagesSent, sendTime := sendPhase(ctx, senderConnMgr, *msgSize, *duration)
+	messagesSent, sendTime := sendPhase(ctx, senderConnMgr, *msgSize, *duration, *durable)
 	log.Printf("Send phase complete. Sent %d messages in %.2f seconds\n", messagesSent, sendTime)
 
 	// Create connection manager for receiving
@@ -233,7 +234,7 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, duration time.Duration) (uint64, float64) {
+func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, duration time.Duration, durable bool) (uint64, float64) {
 	// Create payload
 	payload := make([]byte, msgSize)
 	for i := range payload {
@@ -247,6 +248,12 @@ func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, dur
 	// Send messages until deadline
 	for time.Now().Before(deadline) {
 		message := amqp.NewMessage(payload)
+
+		if durable {
+			message.Header = &amqp.MessageHeader{
+				Durable: true,
+			}
+		}
 
 		sender := connMgr.sender
 		if sender == nil {
