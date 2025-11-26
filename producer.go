@@ -108,6 +108,7 @@ func main() {
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be sent.")
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
+	batchSize := flag.Int("batch", 100, "Number of messages to send before waiting for confirmation (async batch size).")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -169,9 +170,9 @@ func main() {
 
 	// Start the appropriate producer goroutine
 	if len(messages) > 0 {
-		go producer_file(ctx, connMgr, *durable, &messagesSent, messages)
+		go producer_file(ctx, connMgr, *durable, *batchSize, &messagesSent, messages)
 	} else {
-		go producer(ctx, connMgr, *msgSize, *durable, &messagesSent)
+		go producer(ctx, connMgr, *msgSize, *durable, *batchSize, &messagesSent)
 	}
 
 	// Start the throughput reporter goroutine
@@ -270,7 +271,7 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
+func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool, batchSize int, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
 	messageNum := uint64(0)
 	for {
 		for _, msgWithHeaders := range messages {
@@ -330,7 +331,7 @@ func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool
 						break retrySend
 					}
 				}
-				time.Sleep(100 * time.Millisecond) // Wait before sending the next message
+				// Removed sleep - let batching control the flow
 			}
 		}
 		log.Printf("All %d messages from file have been sent. Restarting...", len(messages))
@@ -338,7 +339,7 @@ func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool
 	}
 }
 
-func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64) {
+func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, batchSize int, messagesSent *atomic.Uint64) {
 	// Generate and send dummy payload continuously
 	payload := make([]byte, msgSize)
 	for i := range payload {
@@ -346,6 +347,8 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 	}
 
 	var messageNum uint64
+	batchCount := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -375,6 +378,8 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 				continue
 			}
 
+			// Send without waiting for each message (async)
+			// The AMQP library handles flow control internally
 			err := sender.Send(ctx, message)
 			if err != nil {
 				log.Printf("Failed to send message: %v, attempting reconnection...", err)
@@ -382,10 +387,19 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 					log.Printf("Reconnection failed: %v", err)
 				}
 				time.Sleep(100 * time.Millisecond)
+				batchCount = 0
 				continue
 			}
 
 			messagesSent.Add(1)
+			batchCount++
+
+			// Every batchSize messages, add a small yield to prevent CPU spin
+			if batchCount >= batchSize {
+				batchCount = 0
+				// Small yield to allow other goroutines to run
+				time.Sleep(1 * time.Microsecond)
+			}
 		}
 	}
 }
