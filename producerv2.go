@@ -178,7 +178,7 @@ func main() {
 	}
 
 	// Start the throughput reporter goroutine
-	go throughputReporter(ctx, &messagesSent)
+	go throughputReporter(ctx, &messagesSent, *producers)
 
 	<-ctx.Done()
 
@@ -430,11 +430,16 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 	}
 }
 
-func throughputReporter(ctx context.Context, messagesSent *atomic.Uint64) {
+func throughputReporter(ctx context.Context, messagesSent *atomic.Uint64, numProducers int) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	var lastCount uint64
+	threadLabel := "Thread"
+	if numProducers > 1 {
+		threadLabel = "Threads"
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -443,7 +448,7 @@ func throughputReporter(ctx context.Context, messagesSent *atomic.Uint64) {
 			currentCount := messagesSent.Load()
 			throughput := currentCount - lastCount
 			lastCount = currentCount
-			fmt.Printf("Throughput: %d msg/s\n", throughput)
+			fmt.Printf("%d %s Throughput: %d msg/s\n", numProducers, threadLabel, throughput)
 		}
 	}
 }
