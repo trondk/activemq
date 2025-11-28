@@ -70,8 +70,8 @@ type ConnectionManager struct {
 
 func main() {
 	serverAddr := flag.String("server", "", "Comma-separated list of host:port of the ActiveMQ Artemis AMQP acceptors (e.g., 'localhost:5672,localhost:5673').")
-	username := flag.String("username", "admin", "Username for authentication.")
-	password := flag.String("password", "admin", "Password for authentication.")
+	username := flag.String("username", "", "Username for authentication (optional).")
+	password := flag.String("password", "", "Password for authentication (optional).")
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be received from.")
 	exportMessageIDs := flag.String("export-message-ids", "", "Optional file path to export message IDs to check order (e.g., 'message_ids.txt').")
 	flag.Parse()
@@ -154,7 +154,17 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect to %s...", server)
-		client, err := amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+
+		var client *amqp.Client
+		var err error
+
+		// Use authentication if username is provided, otherwise connect anonymously
+		if cm.username != "" {
+			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+		} else {
+			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
+		}
+
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue

@@ -103,12 +103,11 @@ func parseMessagesFromFile(data []byte, delimiter string) []MessageWithHeaders {
 func main() {
 	serverAddr := flag.String("server", "", "Comma-separated list of host:port of the ActiveMQ Artemis AMQP acceptors (e.g., 'localhost:5672,localhost:5673').")
 	msgSize := flag.Int("size", 1024, "The size of the payload for each message sent.")
-	username := flag.String("username", "admin", "Username for authentication.")
-	password := flag.String("password", "admin", "Password for authentication.")
+	username := flag.String("username", "", "Username for authentication (optional).")
+	password := flag.String("password", "", "Password for authentication (optional).")
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be sent.")
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
-	batchSize := flag.Int("batch", 100, "Number of messages to send before waiting for confirmation (async batch size).")
 	producers := flag.Int("producers", 1, "Number of concurrent producer goroutines for higher throughput.")
 	flag.Parse()
 
@@ -172,9 +171,9 @@ func main() {
 	// Start multiple producer goroutines for concurrent sending
 	for i := 0; i < *producers; i++ {
 		if len(messages) > 0 {
-			go producer_file(ctx, connMgr, *durable, *batchSize, &messagesSent, messages)
+			go producer_file(ctx, connMgr, *durable, &messagesSent, messages)
 		} else {
-			go producer(ctx, connMgr, *msgSize, *durable, *batchSize, &messagesSent)
+			go producer(ctx, connMgr, *msgSize, *durable, &messagesSent)
 		}
 	}
 
@@ -203,7 +202,17 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect to %s...", server)
-		client, err := amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+
+		var client *amqp.Client
+		var err error
+
+		// Use authentication if username is provided, otherwise connect anonymously
+		if cm.username != "" {
+			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+		} else {
+			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
+		}
+
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue
@@ -279,7 +288,7 @@ func (cm *ConnectionManager) Close() {
 	}
 }
 
-func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool, batchSize int, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
+func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool, messagesSent *atomic.Uint64, messages []MessageWithHeaders) {
 	messageNum := uint64(0)
 	for {
 		for _, msgWithHeaders := range messages {
@@ -347,7 +356,7 @@ func producer_file(ctx context.Context, connMgr *ConnectionManager, durable bool
 	}
 }
 
-func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, batchSize int, messagesSent *atomic.Uint64) {
+func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, durable bool, messagesSent *atomic.Uint64) {
 	// Generate and send dummy payload continuously
 	payload := make([]byte, msgSize)
 	for i := range payload {
@@ -355,7 +364,6 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 	}
 
 	var messageNum uint64
-	batchCount := 0
 
 	for {
 		select {
@@ -386,8 +394,6 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 				continue
 			}
 
-			// Send without waiting for each message (async)
-			// The AMQP library handles flow control internally
 			err := sender.Send(ctx, message)
 			if err != nil {
 				log.Printf("Failed to send message: %v, attempting reconnection...", err)
@@ -395,19 +401,10 @@ func producer(ctx context.Context, connMgr *ConnectionManager, msgSize int, dura
 					log.Printf("Reconnection failed: %v", err)
 				}
 				time.Sleep(100 * time.Millisecond)
-				batchCount = 0
 				continue
 			}
 
 			messagesSent.Add(1)
-			batchCount++
-
-			// Every batchSize messages, add a small yield to prevent CPU spin
-			if batchCount >= batchSize {
-				batchCount = 0
-				// Small yield to allow other goroutines to run
-				time.Sleep(1 * time.Microsecond)
-			}
 		}
 	}
 }
