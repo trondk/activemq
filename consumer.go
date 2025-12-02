@@ -66,6 +66,7 @@ type ConnectionManager struct {
 	client      *amqp.Client
 	session     *amqp.Session
 	receiver    *amqp.Receiver
+	debug       bool
 }
 
 func main() {
@@ -74,6 +75,7 @@ func main() {
 	password := flag.String("password", "", "Password for authentication (optional).")
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be received from.")
 	exportMessageIDs := flag.String("export-message-ids", "", "Optional file path to export message IDs to check order (e.g., 'message_ids.txt').")
+	debug := flag.Bool("debug", false, "Enable debug logging for connection errors.")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -104,6 +106,7 @@ func main() {
 		username:  *username,
 		password:  *password,
 		queueName: *queueName,
+		debug:     *debug,
 	}
 
 	// Initial connection
@@ -153,33 +156,55 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		serverIdx := (cm.currentIdx + i) % len(cm.servers)
 		server := cm.servers[serverIdx]
 
-		log.Printf("Attempting to connect to %s...", server)
+		if cm.debug {
+			log.Printf("Attempting to connect to %s... (auth: %v)", server, cm.username != "")
+		} else {
+			log.Printf("Attempting to connect to %s...", server)
+		}
 
 		var client *amqp.Client
 		var err error
 
 		// Use authentication if username is provided, otherwise connect anonymously
 		if cm.username != "" {
+			if cm.debug {
+				log.Printf("Using SASL PLAIN authentication with username: %s", cm.username)
+			}
 			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
 		} else {
+			if cm.debug {
+				log.Printf("Using SASL ANONYMOUS authentication")
+			}
 			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
 		}
 
 		if err != nil {
-			log.Printf("Failed to connect to %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to connect to %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to connect to %s: %v", server, err)
+			}
 			continue
 		}
 
 		session, err := client.NewSession()
 		if err != nil {
-			log.Printf("Failed to create session on %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to create session on %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to create session on %s: %v", server, err)
+			}
 			client.Close()
 			continue
 		}
 
 		receiver, err := session.NewReceiver(amqp.LinkSourceAddress(cm.queueName))
 		if err != nil {
-			log.Printf("Failed to create receiver on %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to create receiver on %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to create receiver on %s: %v", server, err)
+			}
 			client.Close()
 			continue
 		}

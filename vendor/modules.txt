@@ -8,6 +8,9 @@ github.com/Azure/go-amqp/internal/encoding
 github.com/Azure/go-amqp/internal/frames
 github.com/Azure/go-amqp/internal/queue
 github.com/Azure/go-amqp/internal/shared
+# github.com/ibm-messaging/mq-golang/v5 v5.6.7
+## explicit; go 1.18
+github.com/ibm-messaging/mq-golang/v5/ibmmq
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors

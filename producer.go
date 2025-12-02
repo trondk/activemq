@@ -26,6 +26,7 @@ type ConnectionManager struct {
 	client     *amqp.Client
 	session    *amqp.Session
 	sender     *amqp.Sender
+	debug      bool
 }
 
 type MessageWithHeaders struct {
@@ -109,6 +110,7 @@ func main() {
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
 	producers := flag.Int("producers", 1, "Number of concurrent producer goroutines for higher throughput.")
+	debug := flag.Bool("debug", false, "Enable debug logging for connection errors.")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -139,6 +141,7 @@ func main() {
 		username:  *username,
 		password:  *password,
 		queueName: *queueName,
+		debug:     *debug,
 	}
 
 	// Initial connection
@@ -201,26 +204,44 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		serverIdx := (cm.currentIdx + i) % len(cm.servers)
 		server := cm.servers[serverIdx]
 
-		log.Printf("Attempting to connect to %s...", server)
+		if cm.debug {
+			log.Printf("Attempting to connect to %s... (auth: %v)", server, cm.username != "")
+		} else {
+			log.Printf("Attempting to connect to %s...", server)
+		}
 
 		var client *amqp.Client
 		var err error
 
 		// Use authentication if username is provided, otherwise connect anonymously
 		if cm.username != "" {
+			if cm.debug {
+				log.Printf("Using SASL PLAIN authentication with username: %s", cm.username)
+			}
 			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
 		} else {
+			if cm.debug {
+				log.Printf("Using SASL ANONYMOUS authentication")
+			}
 			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
 		}
 
 		if err != nil {
-			log.Printf("Failed to connect to %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to connect to %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to connect to %s: %v", server, err)
+			}
 			continue
 		}
 
 		session, err := client.NewSession()
 		if err != nil {
-			log.Printf("Failed to create session on %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to create session on %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to create session on %s: %v", server, err)
+			}
 			client.Close()
 			continue
 		}
@@ -232,7 +253,11 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 			amqp.LinkSenderSettle(amqp.ModeUnsettled),
 		)
 		if err != nil {
-			log.Printf("Failed to create sender on %s: %v", server, err)
+			if cm.debug {
+				log.Printf("Failed to create sender on %s: %v (error type: %T)", server, err, err)
+			} else {
+				log.Printf("Failed to create sender on %s: %v", server, err)
+			}
 			client.Close()
 			continue
 		}
