@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -26,6 +27,8 @@ type ConnectionManager struct {
 	conn       *amqp.Conn
 	session    *amqp.Session
 	sender     *amqp.Sender
+	ssl        bool
+	insecure   bool
 }
 
 type MessageWithHeaders struct {
@@ -109,6 +112,8 @@ func main() {
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable). Uses SenderSettleModeUnsettled for reliability, SenderSettleModeSettled (fire-and-forget) for non-durable.")
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
 	producers := flag.Int("producers", 1, "Number of concurrent producer goroutines for higher throughput.")
+	ssl := flag.Bool("ssl", false, "Enable SSL/TLS for AMQPS connections.")
+	insecure := flag.Bool("insecure", false, "Skip SSL certificate verification (only valid with -ssl).")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -139,6 +144,8 @@ func main() {
 		username:  *username,
 		password:  *password,
 		queueName: *queueName,
+		ssl:       *ssl,
+		insecure:  *insecure,
 	}
 
 	// Initial connection
@@ -203,12 +210,27 @@ func (cm *ConnectionManager) Connect(ctx context.Context, durable bool) error {
 
 		log.Printf("Attempting to connect to %s...", server)
 
-		// Create AMQP connection with SASL PLAIN authentication
-		conn, err := amqp.Dial(ctx, "amqp://"+server,
-			&amqp.ConnOptions{
-				SASLType: amqp.SASLTypePlain(cm.username, cm.password),
-			},
-		)
+		// Determine scheme based on SSL flag
+		scheme := "amqp://"
+		if cm.ssl {
+			scheme = "amqps://"
+		}
+
+		// Create connection options with SASL PLAIN authentication
+		connOpts := &amqp.ConnOptions{
+			SASLType: amqp.SASLTypePlain(cm.username, cm.password),
+		}
+
+		// Add TLS configuration if SSL is enabled
+		if cm.ssl {
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: cm.insecure,
+			}
+			connOpts.TLSConfig = tlsConfig
+		}
+
+		// Create AMQP connection
+		conn, err := amqp.Dial(ctx, scheme+server, connOpts)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue

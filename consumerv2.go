@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -67,6 +68,8 @@ type ConnectionManager struct {
 	session     *amqp.Session
 	receiver    *amqp.Receiver
 	debug       bool
+	ssl         bool
+	insecure    bool
 }
 
 func main() {
@@ -76,6 +79,8 @@ func main() {
 	queueName := flag.String("queue", "DLQ", "The target queue where messages will be received from.")
 	exportMessageIDs := flag.String("export-message-ids", "", "Optional file path to export message IDs to check order (e.g., 'message_ids.txt').")
 	debug := flag.Bool("debug", false, "Enable debug logging for connection errors.")
+	ssl := flag.Bool("ssl", false, "Enable SSL/TLS for connection.")
+	insecure := flag.Bool("insecure", false, "Skip SSL certificate verification (use with caution).")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -107,6 +112,8 @@ func main() {
 		password:  *password,
 		queueName: *queueName,
 		debug:     *debug,
+		ssl:       *ssl,
+		insecure:  *insecure,
 	}
 
 	// Initial connection
@@ -165,18 +172,40 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		var client *amqp.Client
 		var err error
 
-		// Use authentication if username is provided, otherwise connect anonymously
+		// Build dial options
+		var dialOpts []amqp.ConnOption
+
+		// Add authentication option
 		if cm.username != "" {
 			if cm.debug {
 				log.Printf("Using SASL PLAIN authentication with username: %s", cm.username)
 			}
-			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+			dialOpts = append(dialOpts, amqp.ConnSASLPlain(cm.username, cm.password))
 		} else {
 			if cm.debug {
 				log.Printf("Using SASL ANONYMOUS authentication")
 			}
-			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
+			dialOpts = append(dialOpts, amqp.ConnSASLAnonymous())
 		}
+
+		// Add TLS option if SSL is enabled
+		if cm.ssl {
+			if cm.debug {
+				log.Printf("Using SSL/TLS with insecure=%v", cm.insecure)
+			}
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: cm.insecure,
+			}
+			dialOpts = append(dialOpts, amqp.ConnTLSConfig(tlsConfig))
+		}
+
+		// Determine URL scheme
+		scheme := "amqp://"
+		if cm.ssl {
+			scheme = "amqps://"
+		}
+
+		client, err = amqp.Dial(scheme+server, dialOpts...)
 
 		if err != nil {
 			if cm.debug {

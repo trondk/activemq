@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -25,6 +27,7 @@ type ConnectionManager struct {
 	session    *amqp.Session
 	sender     *amqp.Sender
 	receiver   *amqp.Receiver
+	tlsConfig  *tls.Config
 }
 
 func main() {
@@ -37,6 +40,11 @@ func main() {
 	queueName := flag.String("queue", "DLQ", "The target queue for sending and receiving messages.")
 	durable := flag.Bool("durable", false, "Set message delivery mode to Persistent (Durable).")
 	prometheusOut := flag.String("prometheus-out", "", "Optional: Path to write Prometheus .prom file for node exporter.")
+	tlsEnabled := flag.Bool("tls", false, "Enable TLS/SSL encryption.")
+	tlsCert := flag.String("tls-cert", "", "Path to client certificate file (optional).")
+	tlsKey := flag.String("tls-key", "", "Path to client key file (optional).")
+	tlsCA := flag.String("tls-ca", "", "Path to CA certificate file (optional).")
+	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (insecure, use for testing only).")
 	flag.Parse()
 
 	if *senderAddr == "" {
@@ -61,6 +69,17 @@ func main() {
 		receiverServers[i] = strings.TrimSpace(receiverServers[i])
 	}
 
+	// Build TLS config if enabled
+	var tlsConfig *tls.Config
+	if *tlsEnabled {
+		var err error
+		tlsConfig, err = buildTLSConfig(*tlsCert, *tlsKey, *tlsCA, *insecure)
+		if err != nil {
+			log.Fatalf("Failed to build TLS config: %v", err)
+		}
+		log.Println("TLS/SSL enabled")
+	}
+
 	ctx := context.Background()
 
 	// Create connection manager for sending
@@ -69,6 +88,7 @@ func main() {
 		username:  *username,
 		password:  *password,
 		queueName: *queueName,
+		tlsConfig: tlsConfig,
 	}
 
 	// Connect sender
@@ -89,6 +109,7 @@ func main() {
 		username:  *username,
 		password:  *password,
 		queueName: *queueName,
+		tlsConfig: tlsConfig,
 	}
 
 	// Connect receiver
@@ -147,7 +168,13 @@ func (cm *ConnectionManager) ConnectSender(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect sender to %s...", server)
-		client, err := amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+		dialOpts := []amqp.ConnOption{
+			amqp.ConnSASLPlain(cm.username, cm.password),
+		}
+		if cm.tlsConfig != nil {
+			dialOpts = append(dialOpts, amqp.ConnTLS(true), amqp.ConnTLSConfig(cm.tlsConfig))
+		}
+		client, err := amqp.Dial("amqp://"+server, dialOpts...)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue
@@ -188,7 +215,13 @@ func (cm *ConnectionManager) ConnectReceiver(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect receiver to %s...", server)
-		client, err := amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+		dialOpts := []amqp.ConnOption{
+			amqp.ConnSASLPlain(cm.username, cm.password),
+		}
+		if cm.tlsConfig != nil {
+			dialOpts = append(dialOpts, amqp.ConnTLS(true), amqp.ConnTLSConfig(cm.tlsConfig))
+		}
+		client, err := amqp.Dial("amqp://"+server, dialOpts...)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue
@@ -364,4 +397,42 @@ activemq_benchmark_total_duration_seconds{sender="%s",receiver="%s"} %.3f
 	)
 
 	return err
+}
+
+func buildTLSConfig(certFile, keyFile, caFile string, insecure bool) (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: insecure,
+	}
+
+	// Load CA certificate if provided
+	if caFile != "" {
+		caCert, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+		}
+		caCertPool, err := getCertPool(caCert)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CA certificate: %v", err)
+		}
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	// Load client certificate if provided
+	if certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate: %v", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	return tlsConfig, nil
+}
+
+func getCertPool(caCert []byte) (*x509.CertPool, error) {
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to append CA certificate to pool")
+	}
+	return caCertPool, nil
 }

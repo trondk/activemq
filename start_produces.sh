@@ -1,1 +1,1 @@
-./producer  -password admin -username admin -server 192.168.100.10:5672,192.168.100.11:5672 -durable
+./producer  -password admin -username admin -server 192.168.100.10:5672,127.0.0.1:5672 -durable -debug

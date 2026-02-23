@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +28,8 @@ type ConnectionManager struct {
 	session    *amqp.Session
 	sender     *amqp.Sender
 	debug      bool
+	ssl        bool
+	insecure   bool
 }
 
 type MessageWithHeaders struct {
@@ -111,6 +114,8 @@ func main() {
 	inputFile := flag.String("file", "", "Optional: Load message content from a text file instead of generating dummy payload.")
 	producers := flag.Int("producers", 1, "Number of concurrent producer goroutines for higher throughput.")
 	debug := flag.Bool("debug", false, "Enable debug logging for connection errors.")
+	ssl := flag.Bool("ssl", false, "Enable SSL/TLS for AMQP connection (uses amqps://).")
+	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (use with self-signed certs).")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -142,6 +147,8 @@ func main() {
 		password:  *password,
 		queueName: *queueName,
 		debug:     *debug,
+		ssl:       *ssl,
+		insecure:  *insecure,
 	}
 
 	// Initial connection
@@ -213,22 +220,52 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		var client *amqp.Client
 		var err error
 
+		// Build the scheme
+		scheme := "amqp"
+		if cm.ssl {
+			scheme = "amqps"
+		}
+		addr := scheme + "://" + server
+
+		if cm.debug {
+			log.Printf("Scheme: %s | SSL: %v | Insecure: %v", scheme, cm.ssl, cm.insecure)
+		}
+
+		// Build options dynamically
+		opts := []amqp.ConnOption{}
+
 		// Use authentication if username is provided, otherwise connect anonymously
 		if cm.username != "" {
 			if cm.debug {
 				log.Printf("Using SASL PLAIN authentication with username: %s", cm.username)
 			}
-			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLPlain(cm.username, cm.password))
+			opts = append(opts, amqp.ConnSASLPlain(cm.username, cm.password))
 		} else {
 			if cm.debug {
 				log.Printf("Using SASL ANONYMOUS authentication")
 			}
-			client, err = amqp.Dial("amqp://"+server, amqp.ConnSASLAnonymous())
+			opts = append(opts, amqp.ConnSASLAnonymous())
 		}
+
+		// Add TLS config if insecure mode is enabled
+		if cm.insecure {
+			if cm.debug {
+				log.Printf("TLS Config: InsecureSkipVerify=true (self-signed certificates allowed)")
+			}
+			opts = append(opts, amqp.ConnTLSConfig(&tls.Config{InsecureSkipVerify: true}))
+		} else if cm.ssl {
+			if cm.debug {
+				log.Printf("TLS Config: Standard verification enabled (InsecureSkipVerify=false)")
+			}
+		}
+
+		connStartTime := time.Now()
+		client, err = amqp.Dial(addr, opts...)
+		connDuration := time.Since(connStartTime)
 
 		if err != nil {
 			if cm.debug {
-				log.Printf("Failed to connect to %s: %v (error type: %T)", server, err, err)
+				log.Printf("Failed to connect to %s in %.3fs: %v (error type: %T)", server, connDuration.Seconds(), err, err)
 			} else {
 				log.Printf("Failed to connect to %s: %v", server, err)
 			}
@@ -266,7 +303,11 @@ func (cm *ConnectionManager) Connect(ctx context.Context) error {
 		cm.session = session
 		cm.sender = sender
 		cm.currentIdx = serverIdx
-		log.Printf("Successfully connected to %s", server)
+		if cm.debug {
+			log.Printf("Successfully connected to %s in %.3fs (SSL: %v, Insecure: %v)", server, connDuration.Seconds(), cm.ssl, cm.insecure)
+		} else {
+			log.Printf("Successfully connected to %s", server)
+		}
 		return nil
 	}
 
