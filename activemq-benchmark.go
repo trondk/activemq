@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"pack.ag/amqp"
+	"github.com/Azure/go-amqp"
 )
 
 type ConnectionManager struct {
@@ -23,11 +23,12 @@ type ConnectionManager struct {
 	queueName  string
 	currentIdx int
 	mu         sync.Mutex
-	client     *amqp.Client
+	conn       *amqp.Conn
 	session    *amqp.Session
 	sender     *amqp.Sender
 	receiver   *amqp.Receiver
 	tlsConfig  *tls.Config
+	ssl        bool
 }
 
 func main() {
@@ -89,6 +90,7 @@ func main() {
 		password:  *password,
 		queueName: *queueName,
 		tlsConfig: tlsConfig,
+		ssl:       *tlsEnabled,
 	}
 
 	// Connect sender
@@ -110,6 +112,7 @@ func main() {
 		password:  *password,
 		queueName: *queueName,
 		tlsConfig: tlsConfig,
+		ssl:       *tlsEnabled,
 	}
 
 	// Connect receiver
@@ -168,33 +171,47 @@ func (cm *ConnectionManager) ConnectSender(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect sender to %s...", server)
-		dialOpts := []amqp.ConnOption{
-			amqp.ConnSASLPlain(cm.username, cm.password),
+
+		// Determine scheme based on SSL flag
+		scheme := "amqp://"
+		if cm.ssl {
+			scheme = "amqps://"
 		}
-		if cm.tlsConfig != nil {
-			dialOpts = append(dialOpts, amqp.ConnTLS(true), amqp.ConnTLSConfig(cm.tlsConfig))
+
+		// Create connection options with SASL PLAIN authentication
+		connOpts := &amqp.ConnOptions{
+			SASLType: amqp.SASLTypePlain(cm.username, cm.password),
 		}
-		client, err := amqp.Dial("amqp://"+server, dialOpts...)
+
+		// Add TLS configuration if SSL is enabled
+		if cm.ssl {
+			connOpts.TLSConfig = cm.tlsConfig
+		}
+
+		// Create AMQP connection
+		conn, err := amqp.Dial(ctx, scheme+server, connOpts)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue
 		}
 
-		session, err := client.NewSession()
+		// Create session
+		session, err := conn.NewSession(ctx, nil)
 		if err != nil {
 			log.Printf("Failed to create session on %s: %v", server, err)
-			client.Close()
+			conn.Close()
 			continue
 		}
 
-		sender, err := session.NewSender(amqp.LinkTargetAddress(cm.queueName))
+		// Create sender
+		sender, err := session.NewSender(ctx, cm.queueName, nil)
 		if err != nil {
 			log.Printf("Failed to create sender on %s: %v", server, err)
-			client.Close()
+			conn.Close()
 			continue
 		}
 
-		cm.client = client
+		cm.conn = conn
 		cm.session = session
 		cm.sender = sender
 		cm.currentIdx = serverIdx
@@ -215,33 +232,47 @@ func (cm *ConnectionManager) ConnectReceiver(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect receiver to %s...", server)
-		dialOpts := []amqp.ConnOption{
-			amqp.ConnSASLPlain(cm.username, cm.password),
+
+		// Determine scheme based on SSL flag
+		scheme := "amqp://"
+		if cm.ssl {
+			scheme = "amqps://"
 		}
-		if cm.tlsConfig != nil {
-			dialOpts = append(dialOpts, amqp.ConnTLS(true), amqp.ConnTLSConfig(cm.tlsConfig))
+
+		// Create connection options with SASL PLAIN authentication
+		connOpts := &amqp.ConnOptions{
+			SASLType: amqp.SASLTypePlain(cm.username, cm.password),
 		}
-		client, err := amqp.Dial("amqp://"+server, dialOpts...)
+
+		// Add TLS configuration if SSL is enabled
+		if cm.ssl {
+			connOpts.TLSConfig = cm.tlsConfig
+		}
+
+		// Create AMQP connection
+		conn, err := amqp.Dial(ctx, scheme+server, connOpts)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", server, err)
 			continue
 		}
 
-		session, err := client.NewSession()
+		// Create session
+		session, err := conn.NewSession(ctx, nil)
 		if err != nil {
 			log.Printf("Failed to create session on %s: %v", server, err)
-			client.Close()
+			conn.Close()
 			continue
 		}
 
-		receiver, err := session.NewReceiver(amqp.LinkSourceAddress(cm.queueName))
+		// Create receiver
+		receiver, err := session.NewReceiver(ctx, cm.queueName, nil)
 		if err != nil {
 			log.Printf("Failed to create receiver on %s: %v", server, err)
-			client.Close()
+			conn.Close()
 			continue
 		}
 
-		cm.client = client
+		cm.conn = conn
 		cm.session = session
 		cm.receiver = receiver
 		cm.currentIdx = serverIdx
@@ -256,14 +287,18 @@ func (cm *ConnectionManager) Close() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	ctx := context.Background()
 	if cm.sender != nil {
-		cm.sender.Close(context.Background())
+		cm.sender.Close(ctx)
 	}
 	if cm.receiver != nil {
-		cm.receiver.Close(context.Background())
+		cm.receiver.Close(ctx)
 	}
-	if cm.client != nil {
-		cm.client.Close()
+	if cm.session != nil {
+		cm.session.Close(ctx)
+	}
+	if cm.conn != nil {
+		cm.conn.Close()
 	}
 }
 
@@ -294,7 +329,7 @@ func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, dur
 			break
 		}
 
-		err := sender.Send(ctx, message)
+		err := sender.Send(ctx, message, nil)
 		if err != nil {
 			log.Printf("Failed to send message: %v", err)
 			break
@@ -330,7 +365,7 @@ func consumePhase(ctx context.Context, connMgr *ConnectionManager, expectedMessa
 
 			// Use a context with timeout for each receive
 			receiveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			msg, err := receiver.Receive(receiveCtx)
+			_, err := receiver.Receive(receiveCtx, nil)
 			cancel()
 
 			if err != nil {
@@ -343,7 +378,7 @@ func consumePhase(ctx context.Context, connMgr *ConnectionManager, expectedMessa
 				continue
 			}
 
-			msg.Accept()
+			// Message received successfully
 			messagesReceived.Add(1)
 		}
 	}
