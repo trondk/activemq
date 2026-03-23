@@ -22,13 +22,15 @@ type ConnectionManager struct {
 	password   string
 	queueName  string
 	currentIdx int
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	conn       *amqp.Conn
 	session    *amqp.Session
 	sender     *amqp.Sender
 	receiver   *amqp.Receiver
 	tlsConfig  *tls.Config
 	ssl        bool
+	durable    bool
+	debug      bool
 }
 
 func main() {
@@ -46,6 +48,7 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Path to client key file (optional).")
 	tlsCA := flag.String("tls-ca", "", "Path to CA certificate file (optional).")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (insecure, use for testing only).")
+	debug := flag.Bool("debug", false, "Enable debug logging for detailed connection and message information.")
 	flag.Parse()
 
 	if *senderAddr == "" {
@@ -91,6 +94,8 @@ func main() {
 		queueName: *queueName,
 		tlsConfig: tlsConfig,
 		ssl:       *tlsEnabled,
+		durable:   *durable,
+		debug:     *debug,
 	}
 
 	// Connect sender
@@ -113,6 +118,8 @@ func main() {
 		queueName: *queueName,
 		tlsConfig: tlsConfig,
 		ssl:       *tlsEnabled,
+		durable:   *durable,
+		debug:     *debug,
 	}
 
 	// Connect receiver
@@ -124,6 +131,8 @@ func main() {
 
 	// Phase 2: Consume all messages
 	log.Println("Starting consume phase...")
+	// Give broker a moment to settle messages
+	time.Sleep(1 * time.Second)
 	messagesReceived, consumeTime := consumePhase(ctx, receiverConnMgr, messagesSent)
 	log.Printf("Consume phase complete. Received %d messages in %.2f seconds\n", messagesReceived, consumeTime)
 
@@ -171,6 +180,9 @@ func (cm *ConnectionManager) ConnectSender(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect sender to %s...", server)
+		if cm.debug {
+			log.Printf("DEBUG: Auth: %v, SSL: %v, Queue: %s", cm.username != "", cm.ssl, cm.queueName)
+		}
 
 		// Determine scheme based on SSL flag
 		scheme := "amqp://"
@@ -181,6 +193,9 @@ func (cm *ConnectionManager) ConnectSender(ctx context.Context) error {
 		// Create connection options with SASL PLAIN authentication
 		connOpts := &amqp.ConnOptions{
 			SASLType: amqp.SASLTypePlain(cm.username, cm.password),
+		}
+		if cm.debug {
+			log.Printf("DEBUG: Using scheme %s", scheme)
 		}
 
 		// Add TLS configuration if SSL is enabled
@@ -203,7 +218,7 @@ func (cm *ConnectionManager) ConnectSender(ctx context.Context) error {
 			continue
 		}
 
-		// Create sender
+		// Create sender with no options - let defaults handle it
 		sender, err := session.NewSender(ctx, cm.queueName, nil)
 		if err != nil {
 			log.Printf("Failed to create sender on %s: %v", server, err)
@@ -232,6 +247,9 @@ func (cm *ConnectionManager) ConnectReceiver(ctx context.Context) error {
 		server := cm.servers[serverIdx]
 
 		log.Printf("Attempting to connect receiver to %s...", server)
+		if cm.debug {
+			log.Printf("DEBUG: Auth: %v, SSL: %v, Queue: %s", cm.username != "", cm.ssl, cm.queueName)
+		}
 
 		// Determine scheme based on SSL flag
 		scheme := "amqp://"
@@ -264,8 +282,14 @@ func (cm *ConnectionManager) ConnectReceiver(ctx context.Context) error {
 			continue
 		}
 
-		// Create receiver
-		receiver, err := session.NewReceiver(ctx, cm.queueName, nil)
+		// Create receiver with credit for flow control
+		receiverOpts := &amqp.ReceiverOptions{
+			Credit: 300, // Buffer 300 messages, will replenish as we accept them
+		}
+		receiver, err := session.NewReceiver(ctx, cm.queueName, receiverOpts)
+		if cm.debug {
+			log.Printf("DEBUG: Created receiver for queue %s with Credit: 300", cm.queueName)
+		}
 		if err != nil {
 			log.Printf("Failed to create receiver on %s: %v", server, err)
 			conn.Close()
@@ -281,6 +305,18 @@ func (cm *ConnectionManager) ConnectReceiver(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("failed to connect receiver to any server in the cluster")
+}
+
+func (cm *ConnectionManager) GetSender() *amqp.Sender {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.sender
+}
+
+func (cm *ConnectionManager) GetReceiver() *amqp.Receiver {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.receiver
 }
 
 func (cm *ConnectionManager) Close() {
@@ -310,6 +346,7 @@ func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, dur
 	}
 
 	var messagesSent atomic.Uint64
+	var messageNum uint64
 	startTime := time.Now()
 	deadline := startTime.Add(duration)
 
@@ -317,22 +354,30 @@ func sendPhase(ctx context.Context, connMgr *ConnectionManager, msgSize int, dur
 	for time.Now().Before(deadline) {
 		message := amqp.NewMessage(payload)
 
+		// Add message number for tracking
+		message.ApplicationProperties = map[string]interface{}{
+			"messageNumber": messageNum,
+		}
+		messageNum++
+
 		if durable {
 			message.Header = &amqp.MessageHeader{
 				Durable: true,
 			}
 		}
 
-		sender := connMgr.sender
+		sender := connMgr.GetSender()
 		if sender == nil {
 			log.Printf("No active sender available")
-			break
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		err := sender.Send(ctx, message, nil)
 		if err != nil {
 			log.Printf("Failed to send message: %v", err)
-			break
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		messagesSent.Add(1)
@@ -347,35 +392,52 @@ func consumePhase(ctx context.Context, connMgr *ConnectionManager, expectedMessa
 	startTime := time.Now()
 
 	// Set a timeout to avoid waiting forever if messages are lost
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(60 * time.Second)
 
 	for messagesReceived.Load() < expectedMessages {
 		select {
 		case <-timeout:
-			log.Printf("Consume phase timeout after 30 seconds")
+			log.Printf("Consume phase timeout after 60 seconds. Received %d of %d expected messages", messagesReceived.Load(), expectedMessages)
 			elapsed := time.Since(startTime).Seconds()
 			return messagesReceived.Load(), elapsed
 
 		default:
-			receiver := connMgr.receiver
+			receiver := connMgr.GetReceiver()
 			if receiver == nil {
 				log.Printf("No active receiver available")
-				break
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 
-			// Use a context with timeout for each receive
-			receiveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_, err := receiver.Receive(receiveCtx, nil)
-			cancel()
+			// Receive with overall context timeout
+			msg, err := receiver.Receive(ctx, nil)
 
 			if err != nil {
 				// Check if we've received all expected messages
 				if messagesReceived.Load() >= expectedMessages {
+					log.Printf("All expected messages received: %d", messagesReceived.Load())
 					break
 				}
 				// Otherwise, log the error and continue
-				log.Printf("Failed to receive message: %v", err)
+				log.Printf("Failed to receive message: %v (received %d/%d)", err, messagesReceived.Load(), expectedMessages)
+				time.Sleep(100 * time.Millisecond)
 				continue
+			}
+
+			// Accept the message (releases credit for next message)
+			err = receiver.AcceptMessage(ctx, msg)
+			if err != nil {
+				log.Printf("Failed to accept message: %v", err)
+				continue
+			}
+
+			// Log received message number if debug enabled
+			if connMgr.debug && msg.ApplicationProperties != nil {
+				if msgNum, ok := msg.ApplicationProperties["messageNumber"]; ok {
+					if messagesReceived.Load()%100 == 0 {
+						log.Printf("DEBUG: Received message #%v (%d/%d)", msgNum, messagesReceived.Load()+1, expectedMessages)
+					}
+				}
 			}
 
 			// Message received successfully
